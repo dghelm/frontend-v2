@@ -1,0 +1,31 @@
+name: Deploy to Skynet
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: 16.x
+
+      - run: npm install
+      - run: npm run build
+        env:
+          VUE_APP_FATHOM_SITE_ID: xxx
+          VUE_APP_GA_ID: xxx
+          VUE_APP_BLOCKNATIVE_DAPP_ID: ${{ secrets.VUE_APP_BLOCKNATIVE_DAPP_ID }}
+          VUE_APP_NETWORK: 1
+          VUE_APP_IPFS_NODE: ipfs.fleek.co
+
+      - name: 'Deploy to Skynet'
+        uses: SkynetLabs/deploy-to-skynet-action@v2
+        with:
+          upload-dir: dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry-seed: ${{ secrets.SKYNET_REGISTRY_SEED || '' }}
