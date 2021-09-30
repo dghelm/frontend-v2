@@ -1,3 +1,155 @@
+<script setup lang="ts">
+import { computed, ref, watch } from 'vue';
+import { differenceInSeconds } from 'date-fns';
+import { useIntervalFn } from '@vueuse/core';
+
+import useNumbers from '@/composables/useNumbers';
+import useUserClaimsQuery from '@/composables/queries/useUserClaimsQuery';
+import useBreakpoints from '@/composables/useBreakpoints';
+
+import { TOKENS } from '@/constants/tokens';
+import { bnum } from '@/lib/utils';
+import { claimRewards } from '@/services/claim/claim.service';
+import useWeb3 from '@/services/web3/useWeb3';
+import useEthers from '@/composables/useEthers';
+import useTransactions from '@/composables/useTransactions';
+import useTokens from '@/composables/useTokens';
+import { coingeckoService } from '@/services/coingecko/coingecko.service';
+import { configService } from '@/services/config/config.service';
+import { oneSecondInMs } from '@/composables/useTime';
+
+const isClaiming = ref(false);
+const rewardsEstimateSinceTimestamp = ref('0');
+
+// COMPOSABLES
+const { upToLargeBreakpoint } = useBreakpoints();
+const userClaimsQuery = useUserClaimsQuery();
+const { fNum } = useNumbers();
+const {
+  appNetworkConfig,
+  account,
+  getProvider,
+  isMainnet,
+  isPolygon,
+  isArbitrum,
+  isMismatchedNetwork
+} = useWeb3();
+const { txListener } = useEthers();
+const { addTransaction } = useTransactions();
+const { priceFor, tokens } = useTokens();
+
+const BALTokenAddress = TOKENS.AddressMap[appNetworkConfig.key].BAL;
+
+// COMPUTED
+const userClaims = computed(() =>
+  userClaimsQuery.isSuccess.value ? userClaimsQuery.data?.value : null
+);
+
+const userClaimsLoading = computed(
+  () => userClaimsQuery.isLoading.value || userClaimsQuery.isIdle.value
+);
+
+const totalRewardsBAL = computed(() => {
+  if (userClaims.value != null && userClaims.value.pendingClaimsMap != null) {
+    const availableToClaim =
+      userClaims.value.pendingClaimsMap[BALTokenAddress]?.availableToClaim;
+    if (userClaims.value.currentRewardsEstimate != null) {
+      return bnum(availableToClaim)
+        .plus(userClaims.value.currentRewardsEstimate.rewards)
+        .toString();
+    }
+    return availableToClaim;
+  }
+  return null;
+});
+
+// having multiple unclaimed weeks may cause the browser to freeze (> 5)
+const shouldShowClaimFreezeWarning = computed(() =>
+  userClaims.value != null ? userClaims.value.pendingClaims.length > 5 : false
+);
+
+const availableToClaimTokens = computed(() => {
+  if (userClaims.value != null) {
+    return userClaims.value.pendingClaims.map(
+      ({ availableToClaim, tokenClaimInfo }) => ({
+        token: tokenClaimInfo.token,
+        symbol: tokens.value[tokenClaimInfo.token]?.symbol,
+        amount: availableToClaim,
+        fiatValue: bnum(availableToClaim)
+          .times(priceFor(tokenClaimInfo.token))
+          .toString()
+      })
+    );
+  }
+  return [];
+});
+
+useIntervalFn(async () => {
+  if (
+    userClaims.value != null &&
+    userClaims.value.currentRewardsEstimate != null
+  ) {
+    const diffInSeconds = differenceInSeconds(
+      new Date(),
+      new Date(userClaims.value.currentRewardsEstimate.timestamp)
+    );
+    rewardsEstimateSinceTimestamp.value = bnum(diffInSeconds)
+      .times(userClaims.value.currentRewardsEstimate.velocity)
+      .toString();
+  }
+}, oneSecondInMs);
+
+watch(account, () => {
+  rewardsEstimateSinceTimestamp.value = '0';
+});
+
+watch(isMismatchedNetwork, () => {
+  userClaimsQuery.refetch.value();
+});
+
+// METHODS
+async function claimAvailableRewards() {
+  if (userClaims.value != null) {
+    isClaiming.value = true;
+    try {
+      const tx = await claimRewards(
+        appNetworkConfig.chainId,
+        getProvider(),
+        account.value,
+        userClaims.value.pendingClaims
+      );
+
+      addTransaction({
+        id: tx.hash,
+        type: 'tx',
+        action: 'claim',
+        summary: userClaims.value.pendingClaims
+          .map(
+            pendingClaim =>
+              `${fNum(pendingClaim.availableToClaim, 'token_fixed')} ${
+                tokens.value[pendingClaim.tokenClaimInfo.token]?.symbol
+              }`
+          )
+          .join(', ')
+      });
+
+      txListener(tx, {
+        onTxConfirmed: () => {
+          isClaiming.value = false;
+          userClaimsQuery.refetch.value();
+        },
+        onTxFailed: () => {
+          isClaiming.value = false;
+        }
+      });
+    } catch (e) {
+      console.log(e);
+      isClaiming.value = false;
+    }
+  }
+}
+</script>
+
 <template>
   <BalPopover no-pad>
     <template v-slot:activator>
@@ -13,7 +165,7 @@
         />
         <BalLoadingIcon size="sm" v-if="userClaimsLoading" />
         <span class="hidden lg:block" v-else>{{
-          fNum(totalRewards, totalRewards > 0 ? 'token_fixed' : 'token')
+          totalRewardsBAL != null ? fNum(totalRewardsBAL, 'token_fixed') : '0'
         }}</span>
       </BalBtn>
     </template>
@@ -24,7 +176,7 @@
           {{ $t('airdropExplainer') }}
         </div>
         <BalAlert
-          v-if="shouldShowClaimFreezeWarning & !isPolygon"
+          v-if="shouldShowClaimFreezeWarning && !isPolygon"
           title="Too many claims"
           :description="$t('claimFreezeWarning')"
           type="warning"
@@ -34,23 +186,25 @@
         <div v-if="!isPolygon" class="text-sm text-gray-600 mb-1">
           {{ $t('availableToClaim') }}
         </div>
-        <div v-if="!isPolygon" class="flex justify-between items-center mb-2">
-          <div class="text-lg font-bold">
-            {{
-              fNum(
-                userClaims.availableToClaim,
-                userClaims.availableToClaim > 0 ? 'token_fixed' : 'token'
-              )
-            }}
-            BAL
-          </div>
-          <div>
-            {{
-              availableToClaimInUSD != null
-                ? fNum(availableToClaimInUSD, 'usd')
-                : '-'
-            }}
-          </div>
+        <div v-if="!isPolygon">
+          <template
+            v-for="availableToClaimToken in availableToClaimTokens"
+            :key="availableToClaimToken.token"
+          >
+            <div class="flex justify-between items-center mb-2">
+              <div class="text-lg font-bold">
+                {{
+                  Number(availableToClaimToken.amount) > 0
+                    ? fNum(availableToClaimToken.amount, 'token')
+                    : 0
+                }}
+                {{ availableToClaimToken.symbol }}
+              </div>
+              <div>
+                {{ fNum(availableToClaimToken.fiatValue, 'usd') }}
+              </div>
+            </div>
+          </template>
         </div>
         <BalBtn
           v-if="!isPolygon"
@@ -61,218 +215,25 @@
           :loading="isClaiming"
           :loading-label="$t('claiming')"
           @click="claimAvailableRewards"
-          :disabled="userClaims.availableToClaim == 0"
-          >{{ $t('claim') }} BAL</BalBtn
+          >{{ $t('claim') }} All</BalBtn
         >
       </div>
-      <div class="p-3" v-if="currentRewards != null">
+      <div class="p-3">
         <div class="text-sm text-gray-600 mb-1">
           {{ $t('pendingEstimate') }}
         </div>
         <div class="flex justify-between items-center mb-2">
           <div class="text-lg font-bold">
-            {{
-              fNum(currentRewards, currentRewards > 0 ? 'token_fixed' : 'token')
-            }}
-            BAL
+            -
           </div>
           <div>
-            {{
-              currentRewardsInUSD != null
-                ? fNum(currentRewardsInUSD, 'usd')
-                : '-'
-            }}
+            -
           </div>
         </div>
       </div>
-      <div class="p-3 text-sm" v-else-if="totalRewards == 0">
+      <!-- <div class="p-3 text-sm" v-else-if="totalRewards == 0">
         {{ $t('liquidityProviderCopy') }}
-      </div>
+      </div> -->
     </div>
   </BalPopover>
 </template>
-
-<script lang="ts">
-import { computed, defineComponent, ref, watch } from 'vue';
-import { differenceInSeconds } from 'date-fns';
-import { useIntervalFn } from '@vueuse/core';
-import { useI18n } from 'vue-i18n';
-
-import useNumbers from '@/composables/useNumbers';
-import useUserClaimsQuery from '@/composables/queries/useUserClaimsQuery';
-import useBreakpoints from '@/composables/useBreakpoints';
-
-import { TOKENS } from '@/constants/tokens';
-import { bnum } from '@/lib/utils';
-import { claimRewards } from '@/services/claim';
-import useWeb3 from '@/services/web3/useWeb3';
-import useEthers from '@/composables/useEthers';
-import useTransactions from '@/composables/useTransactions';
-import useTokens from '@/composables/useTokens';
-import { coingeckoService } from '@/services/coingecko/coingecko.service';
-
-export default defineComponent({
-  name: 'AppNavClaimBtn',
-
-  setup() {
-    // DATA
-    const isClaiming = ref(false);
-    const rewardsEstimateSinceTimestamp = ref('0');
-
-    // COMPOSABLES
-    const { upToLargeBreakpoint } = useBreakpoints();
-    const userClaimsQuery = useUserClaimsQuery();
-    const { fNum } = useNumbers();
-    const {
-      appNetworkConfig,
-      account,
-      getProvider,
-      isMainnet,
-      isPolygon,
-      isArbitrum,
-      isMismatchedNetwork
-    } = useWeb3();
-    const { txListener } = useEthers();
-    const { addTransaction } = useTransactions();
-    const { t } = useI18n();
-    const { priceFor } = useTokens();
-
-    const balPrice = computed(() =>
-      priceFor(
-        coingeckoService.prices.addressMapOut(
-          TOKENS.AddressMap[appNetworkConfig.key].BAL
-        )
-      )
-    );
-
-    // COMPUTED
-    const userClaims = computed(() =>
-      userClaimsQuery.isSuccess.value ? userClaimsQuery.data?.value : null
-    );
-
-    const userClaimsLoading = computed(
-      () => userClaimsQuery.isLoading.value || userClaimsQuery.isIdle.value
-    );
-
-    // having multiple unclaimed weeks may cause the browser to freeze (> 5)
-    const shouldShowClaimFreezeWarning = computed(() =>
-      userClaims.value != null
-        ? userClaims.value.pendingClaims.length > 5
-        : false
-    );
-
-    const availableToClaimInUSD = computed(() =>
-      balPrice.value != null && userClaims.value != null
-        ? bnum(userClaims.value?.availableToClaim)
-            .times(balPrice.value)
-            .toString()
-        : null
-    );
-
-    const currentRewards = computed(() =>
-      userClaims.value != null &&
-      userClaims.value.currentRewardsEstimate != null
-        ? bnum(userClaims.value.currentRewardsEstimate.rewards)
-            .plus(rewardsEstimateSinceTimestamp.value)
-            .toString()
-        : null
-    );
-
-    const currentRewardsInUSD = computed(() =>
-      balPrice.value != null && currentRewards.value != null
-        ? bnum(currentRewards.value)
-            .times(balPrice.value)
-            .toString()
-        : null
-    );
-
-    const totalRewards = computed(() =>
-      userClaims.value != null
-        ? bnum(userClaims.value.totalRewards)
-            .plus(rewardsEstimateSinceTimestamp.value)
-            .toString()
-        : null
-    );
-
-    useIntervalFn(async () => {
-      if (userClaims.value != null && userClaims.value.currentRewardsEstimate) {
-        const diffInSeconds = differenceInSeconds(
-          new Date(),
-          new Date(userClaims.value.currentRewardsEstimate.timestamp)
-        );
-        rewardsEstimateSinceTimestamp.value = bnum(diffInSeconds)
-          .times(userClaims.value.currentRewardsEstimate.velocity)
-          .toString();
-      }
-    }, 1000);
-
-    watch(account, () => {
-      rewardsEstimateSinceTimestamp.value = '0';
-    });
-
-    watch(isMismatchedNetwork, () => {
-      userClaimsQuery.refetch.value();
-    });
-
-    // METHODS
-    async function claimAvailableRewards() {
-      if (userClaims.value != null) {
-        isClaiming.value = true;
-        try {
-          const tx = await claimRewards(
-            appNetworkConfig.chainId,
-            getProvider(),
-            account.value,
-            userClaims.value.pendingClaims,
-            userClaims.value.pendingClaimsReports
-          );
-
-          addTransaction({
-            id: tx.hash,
-            type: 'tx',
-            action: 'claim',
-            summary: t('transactionSummary.claimBAL', [
-              fNum(userClaims.value.availableToClaim, 'token_fixed')
-            ])
-          });
-
-          txListener(tx, {
-            onTxConfirmed: () => {
-              isClaiming.value = false;
-              userClaimsQuery.refetch.value();
-            },
-            onTxFailed: () => {
-              isClaiming.value = false;
-            }
-          });
-        } catch (e) {
-          console.log(e);
-          isClaiming.value = false;
-        }
-      }
-    }
-
-    return {
-      // data
-      isClaiming,
-
-      // computed
-      isMainnet,
-      isPolygon,
-      isArbitrum,
-      userClaims,
-      availableToClaimInUSD,
-      currentRewards,
-      currentRewardsInUSD,
-      totalRewards,
-      upToLargeBreakpoint,
-      userClaimsLoading,
-      shouldShowClaimFreezeWarning,
-
-      // methods
-      fNum,
-      claimAvailableRewards
-    };
-  }
-});
-</script>

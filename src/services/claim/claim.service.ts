@@ -4,58 +4,60 @@ import { MerkleRedeem__factory } from '@balancer-labs/typechain';
 import { toWei, soliditySha3 } from 'web3-utils';
 import axios from 'axios';
 
-import { Network } from '@/composables/useNetwork';
+import { Network, networkId } from '@/composables/useNetwork';
 
 import { Claim } from '@/types';
 
-import { ipfsService } from './ipfs/ipfs.service';
+import { ipfsService } from '../ipfs/ipfs.service';
 import { call, sendTransaction } from '@/lib/utils/balancer/web3';
 import { bnum } from '@/lib/utils';
 import { loadTree } from '@/lib/utils/merkle';
 import configs from '@/lib/config';
 import { TOKENS } from '@/constants/tokens';
 
-import { coingeckoService } from './coingecko/coingecko.service';
+import { coingeckoService } from '../coingecko/coingecko.service';
+
+import MultiTokenClaim from './MultiTokenClaim.json';
+import { flatten } from 'lodash';
+import { getAddress } from '@ethersproject/address';
 
 type Snapshot = Record<number, string>;
 
-// @ts-ignore
-export const constants: Record<Network, Record<string, string>> = {
-  [Network.MAINNET]: {
-    merkleRedeem: '0x6d19b2bF3A36A61530909Ae65445a906D98A2Fa8',
-    snapshot:
-      'https://raw.githubusercontent.com/balancer-labs/bal-mining-scripts/master/reports/_current.json'
-  },
-  [Network.KOVAN]: {
-    merkleRedeem: '0x3bc73D276EEE8cA9424Ecb922375A0357c1833B3',
-    snapshot:
-      'https://raw.githubusercontent.com/balancer-labs/bal-mining-scripts/master/reports-kovan/_current.json'
-  },
-  [Network.ARBITRUM]: {
-    merkleRedeem: '0x6bd0B17713aaa29A2d7c9A39dDc120114f9fD809',
-    snapshot:
-      'https://raw.githubusercontent.com/balancer-labs/bal-mining-scripts/master/reports/_current-arbitrum.json'
-  }
+type TokenClaimInfo = {
+  label: string;
+  rewarder: string;
+  token: string;
+  manifest: string;
 };
 
-export async function getSnapshot(network: Network) {
-  if (constants[network]?.snapshot) {
-    const response = await axios.get<Snapshot>(constants[network].snapshot);
-    return response.data || {};
+function getTokenClaimsInfo() {
+  const tokenClaims = MultiTokenClaim[networkId.value];
+  if (tokenClaims != null) {
+    return (tokenClaims as TokenClaimInfo[]).map(tokenClaim => ({
+      ...tokenClaim,
+      token: getAddress(tokenClaim.token)
+    }));
   }
-  return {};
+
+  return null;
+}
+
+export async function getSnapshot(manifest: string) {
+  const response = await axios.get<Snapshot>(manifest);
+
+  return response.data || {};
 }
 
 type ClaimStatus = boolean;
 
 export async function getClaimStatus(
-  network: Network,
   provider: Web3Provider,
   ids: number,
-  account: string
+  account: string,
+  rewarder: string
 ): Promise<ClaimStatus[]> {
   return await call(provider, MerkleRedeem__factory.abi, [
-    constants[network].merkleRedeem,
+    rewarder,
     'claimStatus',
     [account, 1, ids]
   ]);
@@ -70,45 +72,65 @@ export async function getReports(snapshot: Snapshot, weeks: number[]) {
   return Object.fromEntries(reports.map((report, i) => [weeks[i], report]));
 }
 
+export type PendingClaims = {
+  claims: Claim[];
+  reports: Report;
+  tokenClaimInfo: TokenClaimInfo;
+  availableToClaim: string;
+};
+
+export type PendingClaimsMap = Record<string, PendingClaims>;
+
 export async function getPendingClaims(
-  network: Network,
   provider: Web3Provider,
   account: string
-): Promise<{ claims: Claim[]; reports: Report }> {
-  if (!constants[network]) {
-    return {
-      claims: [],
-      reports: {}
-    };
+): Promise<PendingClaimsMap | null> {
+  const tokenClaimsInfo = getTokenClaimsInfo();
+  if (tokenClaimsInfo != null) {
+    const pendingClaimsMap: PendingClaimsMap = {};
+
+    for (const tokenClaimInfo of tokenClaimsInfo) {
+      const snapshot = await getSnapshot(tokenClaimInfo.manifest);
+
+      const claimStatus = await getClaimStatus(
+        provider,
+        Object.keys(snapshot).length,
+        account,
+        tokenClaimInfo.rewarder
+      );
+
+      const pendingWeeks = claimStatus
+        .map((status, i) => [i + 1, status])
+        .filter(([, status]) => !status)
+        .map(([i]) => i) as number[];
+
+      const reports = await getReports(snapshot, pendingWeeks);
+      const claims = Object.entries(reports)
+        .filter((report: Report) => report[1][account])
+        .map((report: Report) => {
+          return {
+            id: report[0],
+            amount: report[1][account],
+            amountDenorm: parseUnits(report[1][account], 18)
+          };
+        });
+
+      const availableToClaim = claims
+        .map(claim => parseFloat(claim.amount))
+        .reduce((total, amount) => total.plus(amount), bnum(0))
+        .toString();
+
+      pendingClaimsMap[tokenClaimInfo.token] = {
+        claims,
+        reports,
+        tokenClaimInfo,
+        availableToClaim
+      };
+    }
+
+    return pendingClaimsMap;
   }
-  const snapshot = await getSnapshot(network);
-
-  const claimStatus = await getClaimStatus(
-    network,
-    provider,
-    Object.keys(snapshot).length,
-    account
-  );
-
-  const pendingWeeks = claimStatus
-    .map((status, i) => [i + 1, status])
-    .filter(([, status]) => !status)
-    .map(([i]) => i) as number[];
-
-  const pendingWeeksReports = await getReports(snapshot, pendingWeeks);
-
-  return {
-    claims: Object.entries(pendingWeeksReports)
-      .filter((report: Report) => report[1][account])
-      .map((report: Report) => {
-        return {
-          id: report[0],
-          amount: report[1][account],
-          amountDenorm: parseUnits(report[1][account], 18)
-        };
-      }),
-    reports: pendingWeeksReports
-  };
+  return null;
 }
 
 type CurrentRewardsEstimateResponse = {
@@ -181,18 +203,25 @@ export async function claimRewards(
   network: Network,
   provider: Web3Provider,
   account: string,
-  pendingClaims: Claim[],
-  reports: Report
+  pendingClaims: PendingClaims[]
 ): Promise<TransactionResponse> {
   try {
-    const claims = pendingClaims.map(week => {
-      const claimBalance = week.amount;
-      const merkleTree = loadTree(reports[week.id]);
+    const allClaims: any = [];
 
-      const proof = merkleTree.getHexProof(
-        soliditySha3(account, toWei(claimBalance))
-      );
-      return [parseInt(week.id), toWei(claimBalance), proof];
+    pendingClaims.forEach(pendingClaim => {
+      const reports = pendingClaim.reports;
+
+      const claims = pendingClaim.claims.map(week => {
+        const claimBalance = week.amount;
+        const merkleTree = loadTree(reports[week.id]);
+
+        const proof = merkleTree.getHexProof(
+          soliditySha3(account, toWei(claimBalance))
+        );
+        return [parseInt(week.id), toWei(claimBalance), proof];
+      });
+
+      allClaims.push(claims);
     });
 
     return sendTransaction(
@@ -200,7 +229,7 @@ export async function claimRewards(
       configs[network].addresses.merkleRedeem,
       MerkleRedeem__factory.abi,
       'claimWeeks',
-      [account, claims]
+      [account, flatten(allClaims)]
     );
   } catch (e) {
     console.log('[Claim] Claim Rewards Error:', e);
